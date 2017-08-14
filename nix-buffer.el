@@ -130,15 +130,19 @@ PROCESS The process whose status changed.
 EVENT The process status change event string."
   (unless (process-live-p process)
     (let ((out-buf (process-buffer process)))
-      (progn
-	(if (= (process-exit-status process) 0)
+      (if (= (process-exit-status process) 0)
+	  (progn
 	    (let ((cur-out (with-current-buffer out-buf
 			     (string-trim-right (buffer-string)))))
 	      (if (string= "" cur-out)
 		  (ignore-errors (delete-file out-link))
 		(unless (string= last-out cur-out)
 		  (with-current-buffer user-buf
-		    (nix-buffer--load-result expr-file cur-out)))))
+		    (nix-buffer--load-result expr-file cur-out))))))
+	(progn
+	  ;; save error
+	  (with-current-buffer err-buf
+	    (save-buffer))
 	  (with-current-buffer
 	      (get-buffer-create "*nix-buffer errors*")
 	    (insert "nix-build for nix-buffer for "
@@ -147,9 +151,16 @@ EVENT The process status change event string."
 		    (string-trim-right event)
 		    " with error output: \n")
 	    (insert-buffer-substring err-buf)
-	    (pop-to-buffer (current-buffer))))
-	(kill-buffer out-buf)
-	(kill-buffer err-buf)))))
+	    (pop-to-buffer (current-buffer)))))
+      (kill-buffer out-buf)
+      (kill-buffer err-buf))))
+
+(defun nix-buffer--nix-instantiate (root expr-file)
+  "Instantiate Nix file.
+
+Passes ROOT to nix EXPR-FILE"
+  (shell-command-to-string
+   (format "nix-instantiate --arg root %s %s" root expr-file)))
 
 (defun nix-buffer--nix-build (root expr-file)
   "Start the nix build.
@@ -160,25 +171,30 @@ EXPR-FILE The file containing the nix expression to build."
 			    (nix-buffer--unique-filename root)))
 	 (out-link (f-join state-dir "result"))
 	 (current-out (file-symlink-p out-link))
-	 (err (generate-new-buffer " nix-buffer-nix-build-stderr")))
+	 (drv-file (nix-buffer--nix-instantiate root expr-file))
+	 (error-file (f-join nix-buffer-directory-name
+			     (nix-buffer--unique-filename drv-file)))
+	 (err (create-file-buffer error-file)))
     (ignore-errors (make-directory state-dir t))
-    (make-process
-     :name "nix-buffer-nix-build"
-     :buffer (generate-new-buffer " nix-buffer-nix-build-stdout")
-     :command (list
-	       "nix-build"
-	       "--arg" "root" root
-	       "--out-link" out-link
-	       expr-file
-	       )
-     :noquery t
-     :sentinel (apply-partially 'nix-buffer--sentinel
-				out-link
-				current-out
-				expr-file
-				(current-buffer)
-				err)
-     :stderr err)
+    (with-current-buffer err
+      (setq-local buffer-offer-save nil))
+    (unless (file-exists-p error-file)
+      (make-process
+       :name "nix-buffer-nix-build"
+       :buffer (generate-new-buffer " nix-buffer-nix-build-stdout")
+       :command (list
+		 "nix-build"
+		 "--out-link" out-link
+		 drv-file
+		 )
+       :noquery t
+       :sentinel (apply-partially 'nix-buffer--sentinel
+				  out-link
+				  current-out
+				  expr-file
+				  (current-buffer)
+				  err)
+       :stderr err))
     (when current-out
       (nix-buffer--load-result expr-file current-out))))
 
