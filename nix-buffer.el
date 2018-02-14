@@ -87,12 +87,12 @@ PATH the path to generate the name from."
 				(concat "\\\\" str)))
 			    path))
 
-(defun nix-buffer--query-safety (expr-file lisp-file)
+(defun nix-buffer--query-safety (drv-file lisp-file)
   "Ask the user whether to trust a Lisp file.
-EXPR-FILE The nix expression leading to this file.
+DRV-FILE The nix expression leading to this file.
 
 LISP-FILE The file in question."
-  (let ((res (yes-or-no-p (concat expr-file
+  (let ((res (yes-or-no-p (concat drv-file
 				  " resulted in unknown Lisp file "
 				  lisp-file
 				  "; trust it? "))))
@@ -102,22 +102,64 @@ LISP-FILE The file in question."
 (defvar nix-buffer-after-load-hook nil
   "Hook run after ‘nix-buffer’ loads an expression.")
 
-(defun nix-buffer--load-result (expr-file out)
+(defun nix-buffer--load-result (drv-file out)
   "Load the result of a ‘nix-buffer’ build, checking for safety.
-EXPR-FILE The nix expression being built.
+DRV-FILE The nix expression being built.
 
 OUT The build result."
   (when (or (gethash out nix-buffer--trusted-exprs)
-	    (nix-buffer--query-safety expr-file out))
+	    (nix-buffer--query-safety drv-file out))
     (load out t t nil t)
     (run-hooks 'nix-buffer-after-load-hook)))
 
-(defun nix-buffer--sentinel
-    (out-link last-out expr-file user-buf err-buf process event)
-  "Handle the results of the nix build.
+(defun nix-buffer--realise-sentinel
+    (out-link last-out drv-file user-buf err-buf process event)
+  "Handle the results of the nix realise.
 OUT-LINK The path to the output symlink.
 
 LAST-OUT The previous build result, if any.
+
+DRV-FILE The nix expression being built.
+
+USER-BUF The buffer to apply the results to.
+
+
+ERR-BUF The standard error buffer of the nix-build
+
+PROCESS The process whose status changed.
+
+EVENT The process status change event string."
+  (unless (process-live-p process)
+    (let ((out-buf (process-buffer process)))
+      (if (= (process-exit-status process) 0)
+	  (let ((cur-out (with-current-buffer out-buf
+			   (string-trim-right (buffer-string)))))
+	    (if (string= "" cur-out)
+		(ignore-errors (delete-file out-link))
+	      (unless (string= last-out cur-out)
+		(with-current-buffer user-buf
+		  (nix-buffer--load-result drv-file cur-out)))))
+	(with-current-buffer
+	    (get-buffer-create "*nix-buffer errors*")
+	  (insert "nix-build for nix-buffer for "
+		  (buffer-name user-buf)
+		  " "
+		  (string-trim-right event)
+		  " with error output: \n")
+	  (insert-buffer-substring err-buf)
+	  (pop-to-buffer (current-buffer))))
+      (let ((kill-buffer-query-functions nil))
+	(kill-buffer out-buf)
+	(kill-buffer err-buf)))))
+
+(defun nix-buffer--instantiate-sentinel
+    (state-dir drv-link last-drv expr-file user-buf err-buf process event)
+  "Handle the results of the nix instantiate.
+STATE-DIR Directory to store result of Nix operations.
+
+DRV-LINK The derivation file.
+
+LAST-DRV The previous build result, if any.
 
 EXPR-FILE The nix expression being built.
 
@@ -130,58 +172,84 @@ PROCESS The process whose status changed.
 EVENT The process status change event string."
   (unless (process-live-p process)
     (let ((out-buf (process-buffer process)))
-      (progn
-	(if (= (process-exit-status process) 0)
-	    (let ((cur-out (with-current-buffer out-buf
-			     (string-trim-right (buffer-string)))))
-	      (if (string= "" cur-out)
-		  (ignore-errors (delete-file out-link))
-		(unless (string= last-out cur-out)
-		  (with-current-buffer user-buf
-		    (nix-buffer--load-result expr-file cur-out)))))
-	  (with-current-buffer
-	      (get-buffer-create "*nix-buffer errors*")
-	    (insert "nix-build for nix-buffer for "
-		    (buffer-name user-buf)
-		    " "
-		    (string-trim-right event)
-		    " with error output: \n")
-	    (insert-buffer-substring err-buf)
-	    (pop-to-buffer (current-buffer))))
-	(let ((kill-buffer-query-functions nil))
-	  (kill-buffer out-buf)
-	  (kill-buffer err-buf))))))
+      (if (= (process-exit-status process) 0)
+	  (let ((cur-drv (with-current-buffer out-buf
+			   (string-trim-right (buffer-string)))))
+	    (if (or (string= "" cur-drv)
+		    (not (file-exists-p cur-drv)))
+		(ignore-errors (delete-file out-link))
+	      (unless (string= last-drv cur-drv)
+		(nix-buffer--nix-realise state-dir cur-drv))))
+	(with-current-buffer
+	    (get-buffer-create "*nix-buffer errors*")
+	  (insert "nix-instantiate for nix-buffer for "
+		  (buffer-name user-buf)
+		  " "
+		  (string-trim-right event)
+		  " with error output: \n")
+	  (insert-buffer-substring err-buf)
+	  (pop-to-buffer (current-buffer))))
+      (let ((kill-buffer-query-functions nil))
+	(kill-buffer out-buf)
+	(kill-buffer err-buf)))))
 
-(defun nix-buffer--nix-build (root expr-file)
+(defun nix-buffer--nix-realise (state-dir drv-file)
+  "Realise the Nix drv.
+STATE-DIR Where to store the result
+
+DRV-FILE The file containing the nix expression to build."
+  (let* ((out-link (f-join state-dir "result"))
+	 (current-out (file-symlink-p out-link))
+	 (err (generate-new-buffer " nix-buffer-nix-realise-stderr")))
+    (make-process
+     :name "nix-buffer-nix-realise"
+     :buffer (generate-new-buffer " nix-buffer-nix-realise-stdout")
+     :command (list
+	       "nix-store" "-r"
+	       "--indirect"
+	       "--add-root" out-link
+	       drv-file
+	       )
+     :noquery t
+     :sentinel (apply-partially 'nix-buffer--realise-sentinel
+				out-link
+				current-out
+				drv-file
+				(current-buffer)
+				err)
+     :stderr err)
+    (when current-out
+      (nix-buffer--load-result drv-file current-out))))
+
+(defun nix-buffer--nix-instantiate (root expr-file)
   "Start the nix build.
 ROOT The path we started from.
 
 EXPR-FILE The file containing the nix expression to build."
   (let* ((state-dir (f-join nix-buffer-directory-name
 			    (nix-buffer--unique-filename root)))
-	 (out-link (f-join state-dir "result"))
-	 (current-out (file-symlink-p out-link))
-	 (err (generate-new-buffer " nix-buffer-nix-build-stderr")))
+	 (drv-link (f-join state-dir "drv"))
+	 (err (generate-new-buffer " nix-buffer-nix-instantiate-stderr")))
     (ignore-errors (make-directory state-dir t))
     (make-process
-     :name "nix-buffer-nix-build"
-     :buffer (generate-new-buffer " nix-buffer-nix-build-stdout")
+     :name "nix-buffer-nix-instantiate"
+     :buffer (generate-new-buffer " nix-buffer-nix-instantiate-stdout")
      :command (list
-	       "nix-build"
+	       "nix-instantiate"
+	       "--indirect"
+	       "--add-root" drv-link
 	       "--arg" "root" root
-	       "--out-link" out-link
 	       expr-file
 	       )
      :noquery t
-     :sentinel (apply-partially 'nix-buffer--sentinel
-				out-link
-				current-out
+     :sentinel (apply-partially 'nix-buffer--instantiate-sentinel
+				state-dir
+				drv-link
+				nil
 				expr-file
 				(current-buffer)
 				err)
-     :stderr err)
-    (when current-out
-      (nix-buffer--load-result expr-file current-out))))
+     :stderr err)))
 
 (defcustom nix-buffer-root-file "dir-locals.nix"
   "File name to use for determining Nix expression to use."
@@ -224,7 +292,7 @@ is removed."
 	 (expr-dir (locate-dominating-file root nix-buffer-root-file)))
     (when expr-dir
       (let ((expr-file (f-expand nix-buffer-root-file expr-dir)))
-	(nix-buffer--nix-build root expr-file)))))
+	(nix-buffer--nix-instantiate root expr-file)))))
 
 (add-hook 'kill-emacs-hook 'nix-buffer-unload-function)
 
